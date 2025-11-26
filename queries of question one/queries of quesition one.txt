@@ -1,0 +1,330 @@
+-- ============================================================================
+-- CORRECTED CODE FOR YOUR ORACLE XE ENVIRONMENT
+-- YOUR DATA PATH: D:\PL-SQL\ORADATA\XE\
+-- ============================================================================
+
+-- ============================================================================
+-- STEP 0: CHECK IF TABLESPACES ALREADY EXIST - DROP THEM FIRST
+-- ============================================================================
+
+-- Check existing tablespaces
+SELECT TABLESPACE_NAME FROM DBA_TABLESPACES;
+
+-- If AUCA_DATA or AUCA_TEMP exist, drop them first:
+-- DROP TABLESPACE AUCA_DATA INCLUDING CONTENTS AND DATAFILES;
+-- DROP TABLESPACE AUCA_TEMP INCLUDING CONTENTS AND DATAFILES;
+
+
+-- ============================================================================
+-- STEP 1: CHECK YOUR CURRENT DATABASE
+-- ============================================================================
+
+SELECT NAME FROM V$DATABASE;
+-- Expected: XEPDB1 (or your container database name)
+
+SHOW CON_NAME;
+-- Expected: CDB$ROOT
+
+
+-- ============================================================================
+-- STEP 2: CREATE TABLESPACES (CORRECTED SYNTAX)
+-- ============================================================================
+
+-- Create permanent tablespace
+CREATE TABLESPACE AUCA_DATA
+  DATAFILE 'D:\PL-SQL\ORADATA\XE\AUCA_DATA_01.dbf' SIZE 200M
+  AUTOEXTEND ON NEXT 50M
+  MAXSIZE UNLIMITED;
+
+-- Create temporary tablespace (different syntax from permanent)
+CREATE TEMPORARY TABLESPACE AUCA_TEMP
+  TEMPFILE 'D:\PL-SQL\ORADATA\XE\AUCA_TEMP_01.tmp' SIZE 100M
+  AUTOEXTEND ON NEXT 10M
+  MAXSIZE UNLIMITED;
+
+-- Verify tablespaces created
+SELECT TABLESPACE_NAME, CONTENTS
+FROM DBA_TABLESPACES
+WHERE TABLESPACE_NAME IN ('AUCA_DATA', 'AUCA_TEMP');
+
+
+-- ============================================================================
+-- STEP 3: CREATE THE PLUGGABLE DATABASE (CORRECTED SYNTAX FOR ORACLE XE)
+-- ============================================================================
+
+CREATE PLUGGABLE DATABASE AUCA_SECDB
+  ADMIN USER pdb_admin IDENTIFIED BY Admin@123
+  FILE_DEST 'D:\PL-SQL\ORADATA\XE';
+
+-- Verify PDB was created
+SELECT PDB_NAME, RESTRICTED
+FROM DBA_PDBS
+WHERE PDB_NAME = 'AUCA_SECDB';
+
+
+-- ============================================================================
+-- STEP 4: OPEN THE NEW PDB
+-- ============================================================================
+
+ALTER PLUGGABLE DATABASE AUCA_SECDB OPEN;
+
+-- Verify PDB is open
+SELECT PDB_NAME, RESTRICTED
+FROM DBA_PDBS
+WHERE PDB_NAME = 'AUCA_SECDB';
+-- Expected: AUCA_SECDB | NO
+
+
+-- ============================================================================
+-- STEP 5: SWITCH TO THE NEW PDB CONTAINER
+-- ============================================================================
+
+ALTER SESSION SET CONTAINER=AUCA_SECDB;
+
+SHOW CON_NAME;
+-- Expected: AUCA_SECDB
+
+
+-- ============================================================================
+-- STEP 6: GRANT PRIVILEGES TO PDB_ADMIN USER
+-- Execute while in AUCA_SECDB container
+-- ============================================================================
+
+-- Grant DBA role (highest privilege)
+GRANT DBA TO pdb_admin;
+
+-- Verify privileges
+SELECT GRANTED_ROLE
+FROM DBA_ROLE_PRIVS
+WHERE GRANTEE = 'PDB_ADMIN';
+
+
+-- ============================================================================
+-- STEP 7: VERIFY PDB_ADMIN CAN DO EVERYTHING
+-- ============================================================================
+
+SELECT USERNAME, ACCOUNT_STATUS
+FROM DBA_USERS
+WHERE USERNAME = 'PDB_ADMIN';
+
+
+-- ============================================================================
+-- NOW: CREATE NEW CONNECTION IN SQL DEVELOPER FOR AUCA_SECDB
+-- ============================================================================
+-- Stop here and create new connection:
+-- 
+-- Connection Name: AUCA_SECDB_Admin
+-- Username: pdb_admin
+-- Password: Admin@123
+-- Hostname: localhost
+-- Port: 1521
+-- SID: AUCA_SECDB
+-- 
+-- Then connect with this new connection and continue below...
+-- ============================================================================
+
+
+-- ============================================================================
+-- STEP 8: CREATE TABLES FOR LOGIN AUDIT SYSTEM
+-- Execute as pdb_admin in AUCA_SECDB connection
+-- ============================================================================
+
+-- Verify you are in correct location
+SELECT USER FROM DUAL;
+-- Expected: PDB_ADMIN
+
+SELECT NAME FROM V$DATABASE;
+-- Expected: XEPDB1
+
+SHOW CON_NAME;
+-- Expected: AUCA_SECDB
+
+
+-- Create LOGIN_AUDIT table
+CREATE TABLE login_audit (
+    login_id NUMBER PRIMARY KEY,
+    username VARCHAR2(50) NOT NULL,
+    attempt_time TIMESTAMP DEFAULT SYSTIMESTAMP,
+    status VARCHAR2(10) NOT NULL CHECK (status IN ('SUCCESS', 'FAILED')),
+    ip_address VARCHAR2(45),
+    device_info VARCHAR2(100)
+);
+
+-- Create sequence for login_id
+CREATE SEQUENCE seq_login_id 
+    START WITH 1 
+    INCREMENT BY 1 
+    NOCACHE;
+
+-- Create SECURITY_ALERTS table
+CREATE TABLE security_alerts (
+    alert_id NUMBER PRIMARY KEY,
+    username VARCHAR2(50) NOT NULL,
+    failed_attempt_count NUMBER NOT NULL,
+    alert_time TIMESTAMP DEFAULT SYSTIMESTAMP,
+    alert_message VARCHAR2(200),
+    email_contact VARCHAR2(100),
+    status VARCHAR2(20) DEFAULT 'PENDING' CHECK (status IN ('PENDING', 'NOTIFIED', 'RESOLVED'))
+);
+
+-- Create sequence for alert_id
+CREATE SEQUENCE seq_alert_id 
+    START WITH 1 
+    INCREMENT BY 1 
+    NOCACHE;
+
+-- Verify tables are created
+SELECT TABLE_NAME
+FROM USER_TABLES
+ORDER BY TABLE_NAME;
+
+
+-- ============================================================================
+-- STEP 9: CREATE THE SECURITY TRIGGER
+-- This is the main logic for detecting suspicious login attempts
+-- ============================================================================
+
+CREATE OR REPLACE TRIGGER tr_check_failed_login_attempts
+AFTER INSERT ON login_audit
+FOR EACH ROW
+DECLARE
+    v_failed_count NUMBER;
+    v_alert_message VARCHAR2(200);
+BEGIN
+    -- Only process FAILED login attempts
+    IF :NEW.status = 'FAILED' THEN
+        
+        -- Count failed attempts by this user TODAY
+        SELECT COUNT(*)
+        INTO v_failed_count
+        FROM login_audit
+        WHERE username = :NEW.username
+        AND TRUNC(attempt_time) = TRUNC(SYSDATE)
+        AND status = 'FAILED';
+        
+        -- If more than 2 failed attempts, create security alert
+        IF v_failed_count > 2 THEN
+            v_alert_message := 'User ' || :NEW.username || 
+                             ' has FAILED login ' || v_failed_count || 
+                             ' times TODAY. SUSPICIOUS ACTIVITY!';
+            
+            -- Insert into security_alerts table
+            INSERT INTO security_alerts (
+                alert_id,
+                username,
+                failed_attempt_count,
+                alert_time,
+                alert_message,
+                email_contact,
+                status
+            ) VALUES (
+                seq_alert_id.NEXTVAL,
+                :NEW.username,
+                v_failed_count,
+                SYSTIMESTAMP,
+                v_alert_message,
+                'security-team@auca.ac.rw',
+                'PENDING'
+            );
+            
+            DBMS_OUTPUT.PUT_LINE('🚨 SECURITY ALERT TRIGGERED!');
+            DBMS_OUTPUT.PUT_LINE('User: ' || :NEW.username);
+            DBMS_OUTPUT.PUT_LINE('Failed Attempts: ' || v_failed_count);
+        END IF;
+    END IF;
+END tr_check_failed_login_attempts;
+/
+
+-- Verify trigger is created
+SELECT TRIGGER_NAME, STATUS
+FROM USER_TRIGGERS;
+
+
+-- ============================================================================
+-- STEP 10: TEST THE SYSTEM WITH SAMPLE DATA
+-- ============================================================================
+
+SET SERVEROUTPUT ON;
+
+DECLARE
+BEGIN
+    DBMS_OUTPUT.PUT_LINE('╔══════════════════════════════════════════════╗');
+    DBMS_OUTPUT.PUT_LINE('║   TESTING LOGIN AUDIT SYSTEM                 ║');
+    DBMS_OUTPUT.PUT_LINE('╚══════════════════════════════════════════════╝');
+    DBMS_OUTPUT.PUT_LINE('');
+    
+    -- First failed attempt
+    INSERT INTO login_audit (login_id, username, attempt_time, status, ip_address, device_info)
+    VALUES (seq_login_id.NEXTVAL, 'john_doe', SYSTIMESTAMP, 'FAILED', '192.168.1.100', 'Windows PC');
+    COMMIT;
+    DBMS_OUTPUT.PUT_LINE('✓ 1st Failed Attempt - john_doe (No alert yet)');
+    
+    -- Second failed attempt
+    INSERT INTO login_audit (login_id, username, attempt_time, status, ip_address, device_info)
+    VALUES (seq_login_id.NEXTVAL, 'john_doe', SYSTIMESTAMP, 'FAILED', '192.168.1.100', 'Windows PC');
+    COMMIT;
+    DBMS_OUTPUT.PUT_LINE('✓ 2nd Failed Attempt - john_doe (No alert yet)');
+    
+    DBMS_OUTPUT.PUT_LINE('');
+    
+    -- Third failed attempt - TRIGGERS ALERT
+    INSERT INTO login_audit (login_id, username, attempt_time, status, ip_address, device_info)
+    VALUES (seq_login_id.NEXTVAL, 'john_doe', SYSTIMESTAMP, 'FAILED', '192.168.1.100', 'Windows PC');
+    COMMIT;
+    DBMS_OUTPUT.PUT_LINE('✓ 3rd Failed Attempt - john_doe');
+    DBMS_OUTPUT.PUT_LINE('');
+    DBMS_OUTPUT.PUT_LINE('✓ SECURITY ALERT GENERATED - Check security_alerts table!');
+    
+END;
+/
+
+
+-- ============================================================================
+-- STEP 11: VIEW THE RESULTS
+-- ============================================================================
+
+DBMS_OUTPUT.PUT_LINE('');
+DBMS_OUTPUT.PUT_LINE('═════════════════════════════════════════════════');
+DBMS_OUTPUT.PUT_LINE('ALL LOGIN ATTEMPTS:');
+DBMS_OUTPUT.PUT_LINE('═════════════════════════════════════════════════');
+
+SELECT 
+    login_id,
+    username,
+    TO_CHAR(attempt_time, 'YYYY-MM-DD HH:MM:SS') AS attempt_time,
+    status,
+    ip_address,
+    device_info
+FROM login_audit
+ORDER BY login_id;
+
+DBMS_OUTPUT.PUT_LINE('');
+DBMS_OUTPUT.PUT_LINE('═════════════════════════════════════════════════');
+DBMS_OUTPUT.PUT_LINE('SECURITY ALERTS GENERATED:');
+DBMS_OUTPUT.PUT_LINE('═════════════════════════════════════════════════');
+
+SELECT 
+    alert_id,
+    username,
+    failed_attempt_count,
+    TO_CHAR(alert_time, 'YYYY-MM-DD HH:MM:SS') AS alert_time,
+    alert_message,
+    status
+FROM security_alerts
+ORDER BY alert_id;
+
+
+-- ============================================================================
+-- STEP 12: TEST CASE 2 - SUCCESSFUL LOGIN
+-- ============================================================================
+
+INSERT INTO login_audit (login_id, username, attempt_time, status, ip_address, device_info)
+VALUES (seq_login_id.NEXTVAL, 'jane_smith', SYSTIMESTAMP, 'SUCCESS', '192.168.1.101', 'Mac OS');
+COMMIT;
+
+DBMS_OUTPUT.PUT_LINE('✓ Successful login recorded for jane_smith');
+
+-- Check results
+SELECT * FROM login_audit WHERE username = 'jane_smith';
+SELECT * FROM security_alerts WHERE username = 'jane_smith';
+-- Should show: login recorded, NO security alert (success login not counted)
